@@ -129,7 +129,7 @@ txn_limbo_worker_bump_confirmed_lsn(struct txn_limbo *limbo)
 {
 	txn_limbo_assert_locked(limbo);
 	txn_limbo_queue_sanity_check(&limbo->queue);
-	while (txn_limbo_is_owned_by_current_instance(limbo) &&
+	while (limbo->state == TXN_LIMBO_STATE_LEADER &&
 	       limbo->queue.volatile_confirmed_lsn >
 	       limbo->queue.confirmed_lsn) {
 		if (limbo->is_in_rollback)
@@ -175,12 +175,12 @@ static inline void
 txn_limbo_create(struct txn_limbo *limbo, struct raft *raft)
 {
 	memset(limbo, 0, sizeof(*limbo));
+	limbo->state = TXN_LIMBO_STATE_INACTIVE;
 	limbo->is_in_recovery = true;
 	txn_limbo_queue_create(&limbo->queue);
 	vclock_create(&limbo->promote_term_map);
 	latch_create(&limbo->state_latch);
 	limbo->svp_confirmed_lsn = -1;
-	limbo->is_frozen_until_promotion = true;
 	limbo->raft = raft;
 	limbo->worker = fiber_new_system("txn_limbo_worker",
 					 txn_limbo_worker_f);
@@ -188,6 +188,51 @@ txn_limbo_create(struct txn_limbo *limbo, struct raft *raft)
 		panic("failed to allocate synchronous queue worker fiber");
 	limbo->worker->f_arg = limbo;
 	fiber_set_joinable(limbo->worker, true);
+}
+
+void
+txn_limbo_update_state(struct txn_limbo *limbo)
+{
+	if (limbo->queue.owner_id == REPLICA_ID_NIL)
+		goto make_inactive;
+	if (limbo->queue.owner_id != instance_id)
+		goto make_replica;
+	/*
+	 * Even if the node owns the limbo and was the leader before restart,
+	 * still it is very likely not to be the leader still afterwards. So
+	 * during recovery and until the next new PROMOTE the limbo can't be
+	 * fully used by this instance.
+	 */
+	if (limbo->is_in_recovery || !limbo->saw_promote)
+		goto make_replica;
+	if (limbo->is_transition_in_progress)
+		goto make_replica;
+	/*
+	 * A crutch for the "Raft-less" synchronous replication. In that mode
+	 * the Raft state machine is maintained up to date, but it plays no role
+	 * in the limbo's state.
+	 */
+	if (!raft_is_enabled(limbo->raft))
+		goto make_leader;
+	if (limbo->raft->state != RAFT_STATE_LEADER)
+		goto make_replica;
+	/*
+	 * Even if the limbo's term is higher than of the Raft state machine,
+	 * still the limbo isn't the source of truth. The limbo can't be fully
+	 * used unless both states are in sync.
+	 */
+	if (limbo->raft->volatile_term == limbo->term)
+		goto make_leader;
+make_replica:
+	limbo->state = TXN_LIMBO_STATE_REPLICA;
+	goto end;
+make_leader:
+	limbo->state = TXN_LIMBO_STATE_LEADER;
+	goto end;
+make_inactive:
+	limbo->state = TXN_LIMBO_STATE_INACTIVE;
+end:
+	box_update_ro_summary();
 }
 
 /*******************************************************************************
@@ -214,18 +259,10 @@ txn_limbo_stop(struct txn_limbo *limbo)
 	VERIFY(fiber_join(limbo->worker) == 0);
 }
 
-static inline bool
-txn_limbo_is_frozen(const struct txn_limbo *limbo)
-{
-	return limbo->frozen_reasons != 0;
-}
-
 bool
 txn_limbo_is_ro(struct txn_limbo *limbo)
 {
-	return limbo->queue.owner_id != REPLICA_ID_NIL &&
-		(!txn_limbo_is_owned_by_current_instance(limbo) ||
-		txn_limbo_is_frozen(limbo));
+	return limbo->state == TXN_LIMBO_STATE_REPLICA;
 }
 
 struct txn_limbo_entry *
@@ -299,7 +336,11 @@ txn_limbo_wait_complete(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 	 * removed in the closest major version (at the moment of writing it was
 	 * upcoming 4.x).
 	 */
-	if (txn_limbo_is_frozen(limbo)) {
+	assert(!txn_limbo_entry_is_complete(entry));
+	assert(entry->lsn >= 0);
+	txn_limbo_lock(limbo);
+	if (limbo->state != TXN_LIMBO_STATE_LEADER) {
+		txn_limbo_unlock(limbo);
 		do {
 			fiber_yield();
 		} while (!txn_limbo_entry_is_complete(entry));
@@ -309,9 +350,6 @@ txn_limbo_wait_complete(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 		}
 		return TXN_LIMBO_WAIT_ENTRY_SUCCESS;
 	}
-	assert(!txn_limbo_entry_is_complete(entry));
-	assert(entry->lsn >= 0);
-	txn_limbo_lock(limbo);
 	txn_limbo_write_rollback(limbo, entry->lsn);
 	txn_limbo_queue_apply_rollback(&limbo->queue, entry->lsn,
 				       TXN_SIGNATURE_QUORUM_TIMEOUT);
@@ -392,9 +430,7 @@ txn_limbo_write_demote(struct txn_limbo *limbo, int64_t lsn, uint64_t term)
 static void
 txn_limbo_confirm(struct txn_limbo *limbo)
 {
-	assert(txn_limbo_is_owned_by_current_instance(limbo));
-	if (txn_limbo_is_frozen(limbo))
-		return;
+	assert(limbo->state == TXN_LIMBO_STATE_LEADER);
 	if (limbo->is_in_rollback)
 		return;
 	if (txn_limbo_queue_bump_volatile_confirm(&limbo->queue))
@@ -404,9 +440,7 @@ txn_limbo_confirm(struct txn_limbo *limbo)
 void
 txn_limbo_ack(struct txn_limbo *limbo, uint32_t replica_id, int64_t lsn)
 {
-	assert(txn_limbo_is_owned_by_current_instance(limbo));
-	if (txn_limbo_is_frozen(limbo))
-		return;
+	assert(limbo->state == TXN_LIMBO_STATE_LEADER);
 	assert(!txn_limbo_is_ro(limbo));
 	if (txn_limbo_queue_ack(&limbo->queue, replica_id, lsn))
 		fiber_wakeup(limbo->worker);
@@ -686,10 +720,13 @@ txn_limbo_req_prepare(struct txn_limbo *limbo,
 	case IPROTO_RAFT_PROMOTE:
 	case IPROTO_RAFT_DEMOTE: {
 		assert(limbo->svp_confirmed_lsn == -1);
+		assert(!limbo->is_transition_in_progress);
+		limbo->is_transition_in_progress = true;
 		limbo->svp_confirmed_lsn = limbo->queue.volatile_confirmed_lsn;
 		limbo->queue.volatile_confirmed_lsn = req->lsn;
 		txn_limbo_update_system_spaces_is_sync_state(
 			limbo, req, /*is_rollback=*/false);
+		txn_limbo_update_state(limbo);
 		break;
 	}
 	/*
@@ -710,11 +747,14 @@ txn_limbo_req_rollback(struct txn_limbo *limbo,
 	case IPROTO_RAFT_DEMOTE: {
 		assert(limbo->is_in_rollback);
 		assert(limbo->svp_confirmed_lsn >= 0);
+		assert(limbo->is_transition_in_progress);
+		limbo->is_transition_in_progress = false;
 		limbo->queue.volatile_confirmed_lsn = limbo->svp_confirmed_lsn;
 		limbo->svp_confirmed_lsn = -1;
 		txn_limbo_update_system_spaces_is_sync_state(
 			limbo, req, /*is_rollback=*/true);
 		limbo->is_in_rollback = false;
+		txn_limbo_update_state(limbo);
 		break;
 	}
 	/*
@@ -727,17 +767,6 @@ txn_limbo_req_rollback(struct txn_limbo *limbo,
 	}
 }
 
-/** Unfreeze the limbo encountering the first new PROMOTE after a restart. */
-static inline void
-txn_limbo_unfreeze_on_first_promote(struct txn_limbo *limbo)
-{
-	txn_limbo_assert_locked(limbo);
-	if (!limbo->is_in_recovery) {
-		limbo->is_frozen_until_promotion = false;
-		box_update_ro_summary();
-	}
-}
-
 void
 txn_limbo_req_commit(struct txn_limbo *limbo, const struct synchro_request *req)
 {
@@ -747,8 +776,11 @@ txn_limbo_req_commit(struct txn_limbo *limbo, const struct synchro_request *req)
 	case IPROTO_RAFT_DEMOTE: {
 		assert(limbo->svp_confirmed_lsn >= 0);
 		assert(limbo->is_in_rollback);
+		assert(limbo->is_transition_in_progress);
+		limbo->is_transition_in_progress = false;
 		limbo->svp_confirmed_lsn = -1;
 		limbo->is_in_rollback = false;
+		txn_limbo_update_state(limbo);
 		break;
 	}
 	default: {
@@ -760,14 +792,8 @@ txn_limbo_req_commit(struct txn_limbo *limbo, const struct synchro_request *req)
 	uint32_t origin = req->origin_id;
 	if (txn_limbo_replica_term(limbo, origin) < term) {
 		vclock_follow(&limbo->promote_term_map, origin, term);
-		if (term > limbo->term) {
+		if (term > limbo->term)
 			limbo->term = term;
-			if (iproto_type_is_promote_request(req->type)) {
-				if (term >= limbo->raft->volatile_term)
-					txn_limbo_unfence(limbo);
-				txn_limbo_unfreeze_on_first_promote(&txn_limbo);
-			}
-		}
 	}
 	if (vclock_is_set(&req->confirmed_vclock)) {
 		vclock_copy(&limbo->queue.confirmed_vclock,
@@ -775,28 +801,25 @@ txn_limbo_req_commit(struct txn_limbo *limbo, const struct synchro_request *req)
 	}
 
 	int64_t lsn = req->lsn;
-	switch (req->type) {
-	case IPROTO_RAFT_CONFIRM:
+	if (req->type == IPROTO_RAFT_CONFIRM) {
 		txn_limbo_queue_apply_confirm(&limbo->queue, lsn);
-		break;
-	case IPROTO_RAFT_ROLLBACK:
+		return;
+	}
+	if (req->type == IPROTO_RAFT_ROLLBACK) {
 		txn_limbo_queue_apply_rollback(&limbo->queue, lsn,
 					       TXN_SIGNATURE_SYNC_ROLLBACK);
-		break;
-	case IPROTO_RAFT_PROMOTE:
-		txn_limbo_queue_transfer_ownership(&limbo->queue,
-						   req->origin_id, lsn);
-		box_update_ro_summary();
-		break;
-	case IPROTO_RAFT_DEMOTE:
-		txn_limbo_queue_transfer_ownership(&limbo->queue,
-						   REPLICA_ID_NIL, lsn);
-		box_update_ro_summary();
-		break;
-	default:
-		unreachable();
+		return;
 	}
-	return;
+	assert(req->type == IPROTO_RAFT_PROMOTE ||
+	       req->type == IPROTO_RAFT_DEMOTE);
+	uint32_t new_owner = REPLICA_ID_NIL;
+	if (req->type == IPROTO_RAFT_PROMOTE) {
+		if (!limbo->is_in_recovery)
+			limbo->saw_promote = true;
+		new_owner = req->origin_id;
+	}
+	txn_limbo_queue_transfer_ownership(&limbo->queue, new_owner, lsn);
+	txn_limbo_update_state(limbo);
 }
 
 int
@@ -815,10 +838,8 @@ txn_limbo_process(struct txn_limbo *limbo, const struct synchro_request *req)
 void
 txn_limbo_on_parameters_change(struct txn_limbo *limbo)
 {
-	if (txn_limbo_is_empty(limbo))
-		return;
 	/* The replication_synchro_quorum value may have changed. */
-	if (txn_limbo_is_owned_by_current_instance(limbo))
+	if (limbo->state == TXN_LIMBO_STATE_LEADER)
 		txn_limbo_confirm(limbo);
 	/*
 	 * Wakeup all the others - timed out will rollback. Also
@@ -828,20 +849,6 @@ txn_limbo_on_parameters_change(struct txn_limbo *limbo)
 	 * sync transactions can live on replica infinitely.
 	 */
 	fiber_cond_broadcast(&limbo->queue.cond);
-}
-
-void
-txn_limbo_fence(struct txn_limbo *limbo)
-{
-	limbo->is_frozen_due_to_fencing = true;
-	box_update_ro_summary();
-}
-
-void
-txn_limbo_unfence(struct txn_limbo *limbo)
-{
-	limbo->is_frozen_due_to_fencing = false;
-	box_update_ro_summary();
 }
 
 void
@@ -865,6 +872,7 @@ txn_limbo_finish_recovery(struct txn_limbo *limbo)
 {
 	assert(limbo->is_in_recovery);
 	limbo->is_in_recovery = false;
+	txn_limbo_update_state(limbo);
 }
 
 void
