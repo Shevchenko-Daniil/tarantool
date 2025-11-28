@@ -39,6 +39,7 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
+struct raft;
 struct synchro_request;
 
 /**
@@ -138,6 +139,11 @@ struct txn_limbo {
 	 * can't be any inconsistencies.
 	 */
 	bool do_validate;
+	/**
+	 * The elections state machine that controls the limbo when elections
+	 * are enabled.
+	 */
+	struct raft *raft;
 	/**
 	 * Asynchronously tries to close the gap between the `confirmed_lsn` and
 	 * the `volatile_confirmed_lsn` by writing a CONFIRM request to the WAL
@@ -394,7 +400,7 @@ txn_limbo_is_owned_by_current_instance(const struct txn_limbo *limbo)
  * Initialize qsync engine.
  */
 void
-txn_limbo_init();
+txn_limbo_init(struct raft *raft);
 
 /**
  * Denitialize qsync engine.
